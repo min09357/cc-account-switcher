@@ -6,7 +6,7 @@
 set -euo pipefail
 
 # Configuration
-readonly BACKUP_DIR="$HOME/.claude-switch-backup"
+readonly BACKUP_DIR="$HOME/.claude-account-switch"
 readonly SEQUENCE_FILE="$BACKUP_DIR/sequence.json"
 
 # Container detection
@@ -386,7 +386,7 @@ cmd_add_account() {
 # Remove account
 cmd_remove_account() {
     if [[ $# -eq 0 ]]; then
-        echo "Usage: $0 --remove-account <account_number|email>"
+        echo "Usage: cs r <account_number|email>"
         exit 1
     fi
     
@@ -482,7 +482,7 @@ first_run_setup() {
     read -r response
     
     if [[ "$response" == "n" || "$response" == "N" ]]; then
-        echo "Setup cancelled. You can run '$0 --add-account' later."
+        echo "Setup cancelled. You can run 'cs a' later."
         return 1
     fi
     
@@ -490,34 +490,63 @@ first_run_setup() {
     return 0
 }
 
-# List accounts
+# List accounts with live usage data (parallel fetch per account)
 cmd_list() {
     if [[ ! -f "$SEQUENCE_FILE" ]]; then
         echo "No accounts are managed yet."
         first_run_setup
         exit 0
     fi
-    
+
     # Get current active account from .claude.json
     local current_email
     current_email=$(get_current_account)
-    
+
     # Find which account number corresponds to the current email
     local active_account_num=""
     if [[ "$current_email" != "none" ]]; then
-        active_account_num=$(jq -r --arg email "$current_email" '.accounts | to_entries[] | select(.value.email == $email) | .key' "$SEQUENCE_FILE" 2>/dev/null)
+        active_account_num=$(jq -r --arg email "$current_email" \
+            '.accounts | to_entries[] | select(.value.email == $email) | .key' \
+            "$SEQUENCE_FILE" 2>/dev/null)
     fi
-    
+
+    # Read sequence and emails into arrays
+    local -a seq_nums seq_emails
+    while IFS= read -r n; do seq_nums+=("$n"); done < <(jq -r '.sequence[]' "$SEQUENCE_FILE")
+    for n in "${seq_nums[@]}"; do
+        seq_emails+=("$(jq -r --arg n "$n" '.accounts[$n].email' "$SEQUENCE_FILE")")
+    done
+
+    # Calculate max email length for usage column alignment
+    local maxlen=0
+    for email in "${seq_emails[@]}"; do
+        if (( ${#email} > maxlen )); then maxlen=${#email}; fi
+    done
+
+    # Fetch usage for all accounts in parallel
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    for i in "${!seq_nums[@]}"; do
+        local num="${seq_nums[$i]}" email="${seq_emails[$i]}"
+        fetch_account_usage_str "$num" "$email" "$active_account_num" > "$tmpdir/$i" &
+    done
+    wait
+
+    # Print results in sequence order
     echo "Accounts:"
-    jq -r --arg active "$active_account_num" '
-        .sequence[] as $num |
-        .accounts["\($num)"] |
-        if "\($num)" == $active then
-            "  \($num): \(.email) (active)"
+    for i in "${!seq_nums[@]}"; do
+        local num="${seq_nums[$i]}" email="${seq_emails[$i]}"
+        local usage_str prefix
+        usage_str=$(cat "$tmpdir/$i")
+        if [[ "$num" == "$active_account_num" ]]; then
+            prefix="(active) "
         else
-            "  \($num): \(.email)"
-        end
-    ' "$SEQUENCE_FILE"
+            prefix="         "
+        fi
+        printf '%s%s: %-*s  %s\n' "$prefix" "$num" "$maxlen" "$email" "$usage_str"
+    done
+
+    rm -rf "$tmpdir"
 }
 
 # Switch to next account
@@ -542,7 +571,7 @@ cmd_switch() {
         local account_num
         account_num=$(jq -r '.activeAccountNumber' "$SEQUENCE_FILE")
         echo "It has been automatically added as Account-$account_num."
-        echo "Please run './ccswitch.sh --switch' again to switch to the next account."
+        echo "Please run 'cs s' again to switch to the next account."
         exit 0
     fi
     
@@ -569,7 +598,7 @@ cmd_switch() {
 # Switch to specific account
 cmd_switch_to() {
     if [[ $# -eq 0 ]]; then
-        echo "Usage: $0 --switch-to <account_number|email>"
+        echo "Usage: cs st <account_number|email>"
         exit 1
     fi
     
@@ -679,26 +708,99 @@ perform_switch() {
     
 }
 
+# Convert ISO8601 date to epoch seconds (handles fractional seconds and timezone)
+iso_to_epoch() {
+    local iso_date="$1"
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+        date -j -f "%Y-%m-%dT%H:%M:%S" "${iso_date%%.*}" "+%s" 2>/dev/null || echo "0"
+    else
+        date -d "$iso_date" "+%s" 2>/dev/null || echo "0"
+    fi
+}
+
+# Fetch raw usage JSON for a given access token
+fetch_usage_api() {
+    local token="$1"
+    curl -s --max-time 8 "https://api.anthropic.com/api/oauth/usage" \
+        -H "Authorization: Bearer $token" \
+        -H "anthropic-beta: oauth-2025-04-20" \
+        -H "User-Agent: claude-code/2.0.32" 2>/dev/null || true
+}
+
+# Build usage display string for one account; always exits 0 (falls back to "?" on any error)
+fetch_account_usage_str() {
+    local num="$1"
+    local email="$2"
+    local active_num="$3"
+    local fallback="(?, ?), (?, ?), (? / ?)"
+
+    # Read credentials via platform abstraction
+    local creds
+    if [[ "$num" == "$active_num" ]]; then
+        creds=$(read_credentials)
+    else
+        creds=$(read_account_credentials "$num" "$email")
+    fi
+
+    local token
+    token=$(echo "$creds" | jq -r '.claudeAiOauth.accessToken // empty' 2>/dev/null)
+    if [[ -z "$token" ]]; then echo "$fallback"; return 0; fi
+
+    local resp
+    resp=$(fetch_usage_api "$token")
+    if [[ -z "$resp" ]]; then echo "$fallback"; return 0; fi
+
+    # Validate response has expected fields
+    local s_pct
+    s_pct=$(echo "$resp" | jq -r '.five_hour.utilization // empty' 2>/dev/null)
+    if [[ -z "$s_pct" ]]; then echo "$fallback"; return 0; fi
+
+    # Extract and round percentages
+    local w_pct s_reset w_reset used_c limit_c
+    s_pct=$(echo "$resp"  | jq -r '(.five_hour.utilization // 0) | round' 2>/dev/null)
+    w_pct=$(echo "$resp"  | jq -r '(.seven_day.utilization  // 0) | round' 2>/dev/null)
+    s_reset=$(echo "$resp" | jq -r '.five_hour.resets_at // ""' 2>/dev/null)
+    w_reset=$(echo "$resp" | jq -r '.seven_day.resets_at  // ""' 2>/dev/null)
+    # extra_usage: null fields become 0 via // 0; API returns cents as float, floor to int
+    used_c=$(echo  "$resp" | jq -r '(.extra_usage.used_credits  // 0) | floor' 2>/dev/null)
+    limit_c=$(echo "$resp" | jq -r '(.extra_usage.monthly_limit // 0) | floor' 2>/dev/null)
+
+    # Calculate remaining seconds for session and weekly resets
+    local now ssec wsec
+    now=$(date +%s)
+    ssec=$(( $(iso_to_epoch "$s_reset") - now ))
+    wsec=$(( $(iso_to_epoch "$w_reset") - now ))
+    if (( ssec < 0 )); then ssec=0; fi
+    if (( wsec < 0 )); then wsec=0; fi
+
+    printf '(%d%%, %d%%), (%dh %dm, %dd %dh %dm), (%d.%02d$ / %d.%02d$)' \
+        "$s_pct" "$w_pct" \
+        $(( ssec/3600 )) $(( (ssec%3600)/60 )) \
+        $(( wsec/86400 )) $(( (wsec%86400)/3600 )) $(( (wsec%3600)/60 )) \
+        $(( used_c/100 )) $(( used_c%100 )) \
+        $(( limit_c/100 )) $(( limit_c%100 ))
+}
+
 # Show usage
 show_usage() {
     echo "Multi-Account Switcher for Claude Code"
-    echo "Usage: $0 [COMMAND]"
+    echo "Usage: cs [COMMAND]"
     echo ""
     echo "Commands:"
-    echo "  --add-account                    Add current account to managed accounts"
-    echo "  --remove-account <num|email>    Remove account by number or email"
-    echo "  --list                           List all managed accounts"
-    echo "  --switch                         Rotate to next account in sequence"
-    echo "  --switch-to <num|email>          Switch to specific account number or email"
-    echo "  --help                           Show this help message"
+    echo "  a               Add current account to managed accounts"
+    echo "  r <num|email>   Remove account by number or email"
+    echo "  l               List all managed accounts"
+    echo "  s               Rotate to next account in sequence"
+    echo "  st <num|email>  Switch to specific account number or email"
+    echo "  h               Show this help message"
     echo ""
     echo "Examples:"
-    echo "  $0 --add-account"
-    echo "  $0 --list"
-    echo "  $0 --switch"
-    echo "  $0 --switch-to 2"
-    echo "  $0 --switch-to user@example.com"
-    echo "  $0 --remove-account user@example.com"
+    echo "  cs a"
+    echo "  cs l"
+    echo "  cs s"
+    echo "  cs st 2"
+    echo "  cs st user@example.com"
+    echo "  cs r user@example.com"
 }
 
 # Main script logic
@@ -713,24 +815,24 @@ main() {
     check_dependencies
     
     case "${1:-}" in
-        --add-account)
+        a)
             cmd_add_account
             ;;
-        --remove-account)
+        r)
             shift
             cmd_remove_account "$@"
             ;;
-        --list)
+        l)
             cmd_list
             ;;
-        --switch)
+        s)
             cmd_switch
             ;;
-        --switch-to)
+        st)
             shift
             cmd_switch_to "$@"
             ;;
-        --help)
+        h)
             show_usage
             ;;
         "")

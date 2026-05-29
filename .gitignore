@@ -1,7 +1,3 @@
-
-# Claude Code local configuration files
-.claude/settings.local.json
-
 # OS files
 .DS_Store
 Thumbs.db
@@ -12,3 +8,7 @@ Thumbs.db
 # Temporary files
 *.tmp
 .temp/
+
+
+.claude/
+CLAUDE.md
