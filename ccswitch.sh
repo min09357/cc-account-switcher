@@ -702,9 +702,6 @@ perform_switch() {
     echo "Switched to Account-$target_account ($target_email)"
     # Display updated account list
     cmd_list
-    echo ""
-    echo "Please restart Claude Code to use the new authentication."
-    echo ""
     
 }
 
