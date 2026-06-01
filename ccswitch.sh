@@ -286,9 +286,27 @@ write_account_config() {
     local email="$2"
     local config="$3"
     local config_file="$BACKUP_DIR/configs/.claude-config-${account_num}-${email}.json"
-    
+
     echo "$config" > "$config_file"
     chmod 600 "$config_file"
+}
+
+# Delete an account's credential and config backups (platform-aware)
+delete_account_backups() {
+    local account_num="$1"
+    local email="$2"
+    local platform
+    platform=$(detect_platform)
+
+    case "$platform" in
+        macos)
+            security delete-generic-password -s "Claude Code-Account-${account_num}-${email}" 2>/dev/null || true
+            ;;
+        linux|wsl)
+            rm -f "$BACKUP_DIR/credentials/.claude-credentials-${account_num}-${email}.json"
+            ;;
+    esac
+    rm -f "$BACKUP_DIR/configs/.claude-config-${account_num}-${email}.json"
 }
 
 # Initialize sequence.json if it doesn't exist
@@ -304,13 +322,15 @@ init_sequence_file() {
     fi
 }
 
-# Get next account number
+# Get next account number.
+# cmd_remove_account compact-renumbers accounts to 1..N, so keys are always
+# contiguous and max+1 is exactly the next free slot.
 get_next_account_number() {
     if [[ ! -f "$SEQUENCE_FILE" ]]; then
         echo "1"
         return
     fi
-    
+
     local max_num
     max_num=$(jq -r '.accounts | keys | map(tonumber) | max // 0' "$SEQUENCE_FILE")
     echo $((max_num + 1))
@@ -442,30 +462,89 @@ cmd_remove_account() {
         exit 0
     fi
     
-    # Remove backup files
-    local platform
-    platform=$(detect_platform)
-    case "$platform" in
-        macos)
-            security delete-generic-password -s "Claude Code-Account-${account_num}-${email}" 2>/dev/null || true
-            ;;
-        linux|wsl)
-            rm -f "$BACKUP_DIR/credentials/.claude-credentials-${account_num}-${email}.json"
-            ;;
-    esac
-    rm -f "$BACKUP_DIR/configs/.claude-config-${account_num}-${email}.json"
-    
-    # Update sequence.json
+    # Remove the target account's backups
+    delete_account_backups "$account_num" "$email"
+
+    # Compact-renumber the surviving accounts so numbers stay contiguous 1..N.
+    # Account numbers are baked into backup storage (filenames / keychain service
+    # names), so relocating a number means moving its backing data too.
+
+    # Survivor old numbers in their current sequence (rotation) order.
+    local old_order_json
+    old_order_json=$(jq -c --arg num "$account_num" \
+        '[ .sequence[] | select(. != ($num | tonumber)) ]' "$SEQUENCE_FILE")
+
+    # Assign new numbers by sequence position (i-th survivor -> i), collecting
+    # only the accounts whose number actually changes.
+    local -a survivors
+    mapfile -t survivors < <(printf '%s' "$old_order_json" | jq -r '.[]')
+
+    local -a moves_old moves_new moves_email
+    local new=0 old em
+    for old in "${survivors[@]}"; do
+        new=$((new + 1))
+        if [[ "$old" != "$new" ]]; then
+            em=$(jq -r --arg n "$old" '.accounts[$n].email' "$SEQUENCE_FILE")
+            moves_old+=("$old")
+            moves_new+=("$new")
+            moves_email+=("$em")
+        fi
+    done
+
+    # New numbers are always <= old numbers (we only ever shift down). Executing
+    # the moves in ascending old-number order guarantees a destination slot is
+    # already vacated before we write to it, so no live backup is overwritten.
+    # sequence order is not necessarily ascending, so sort the move list here;
+    # the new-number assignment above is unaffected (it used sequence order).
+    local -a move_order
+    mapfile -t move_order < <(
+        local i
+        for i in "${!moves_old[@]}"; do
+            printf '%s\t%s\n' "${moves_old[$i]}" "$i"
+        done | sort -n | cut -f2
+    )
+
+    local idx creds config
+    for idx in "${move_order[@]}"; do
+        old="${moves_old[$idx]}"
+        new="${moves_new[$idx]}"
+        em="${moves_email[$idx]}"
+
+        # read -> write(new) -> delete(old): a crash mid-move leaves both copies
+        # (recoverable) rather than a gap.
+        creds=$(read_account_credentials "$old" "$em")
+        config=$(read_account_config "$old" "$em")
+        if [[ -z "$creds" || -z "$config" ]]; then
+            echo "Error: Missing backup data for Account-$old; aborting renumber"
+            exit 1
+        fi
+        write_account_credentials "$new" "$em" "$creds"
+        write_account_config "$new" "$em" "$config"
+        delete_account_backups "$old" "$em"
+    done
+
+    # Rewrite sequence.json metadata in a single pass: remap .accounts keys,
+    # .sequence values, and .activeAccountNumber to the new numbering. A removed
+    # or now-nonexistent active account collapses to null.
     local updated_sequence
-    updated_sequence=$(jq --arg num "$account_num" --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '
-        del(.accounts[$num]) |
-        .sequence = (.sequence | map(select(. != ($num | tonumber)))) |
-        .lastUpdated = $now
+    updated_sequence=$(jq \
+        --argjson oldOrder "$old_order_json" \
+        --arg active "$active_account" \
+        --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '
+        .accounts as $accountsIn
+        | ($oldOrder | to_entries | map({key: (.value | tostring), value: (.key + 1)}) | from_entries) as $remap
+        | .accounts = (reduce ($remap | to_entries[]) as $e ({}; .[($e.value | tostring)] = $accountsIn[$e.key]))
+        | .sequence = ($oldOrder | map($remap[(. | tostring)]))
+        | .activeAccountNumber = (if $active == "null" or ($active | length) == 0 then null else ($remap[$active] // null) end)
+        | .lastUpdated = $now
     ' "$SEQUENCE_FILE")
-    
+
     write_json "$SEQUENCE_FILE" "$updated_sequence"
-    
+
     echo "Account-$account_num ($email) has been removed"
+    if [[ ${#moves_old[@]} -gt 0 ]]; then
+        echo "Renumbered remaining accounts to 1..${#survivors[@]}"
+    fi
 }
 
 # First-run setup workflow
